@@ -712,9 +712,11 @@ impl PendingPresentedRender {
 
     /// Polls without blocking for exact drawable presentation and command-buffer success.
     pub fn try_complete(&mut self) -> Result<PresentedDrawableProgress, RenderCommandError> {
+        let camera_drawable: &ProtocolObject<dyn CAMetalDrawable> = &self._drawable;
+        let metal_drawable: &ProtocolObject<dyn MTLDrawable> = camera_drawable.as_ref();
         let progress = self
             .completion
-            .try_complete()
+            .try_complete_or_observe(metal_drawable)
             .map_err(RenderCommandError::Presentation)?;
         if matches!(progress, PresentedDrawableProgress::Presented(_)) {
             let status = self.command_buffer.status();

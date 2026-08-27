@@ -15,7 +15,8 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLDevice, MTLDrawable, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLTexture,
+    MTLBuffer, MTLDevice, MTLDrawable, MTLPixelFormat, MTLRegion, MTLResource, MTLResourceOptions,
+    MTLStorageMode, MTLTexture, MTLTextureType,
 };
 use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle};
@@ -62,8 +63,19 @@ pub fn layer_for_window(
 pub enum BufferTransferError {
     /// Metal refused to allocate the requested shared buffer.
     Allocation,
+    /// The supplied buffer is not CPU-accessible shared storage.
+    UnsupportedStorage,
     /// The requested byte range does not fit the exact Metal buffer.
     Range,
+}
+
+fn require_shared_buffer(
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+) -> Result<(), BufferTransferError> {
+    if buffer.storageMode() != MTLStorageMode::Shared {
+        return Err(BufferTransferError::UnsupportedStorage);
+    }
+    Ok(())
 }
 
 /// Allocates one shared Metal buffer initialized from the exact supplied bytes.
@@ -95,6 +107,7 @@ pub fn write_shared_buffer(
     offset: usize,
     bytes: &[u8],
 ) -> Result<(), BufferTransferError> {
+    require_shared_buffer(buffer)?;
     let end = offset
         .checked_add(bytes.len())
         .ok_or(BufferTransferError::Range)?;
@@ -123,6 +136,7 @@ pub fn read_shared_buffer(
     buffer: &ProtocolObject<dyn MTLBuffer>,
     range: Range<usize>,
 ) -> Result<Vec<u8>, BufferTransferError> {
+    require_shared_buffer(buffer)?;
     if range.start > range.end || range.end > buffer.length() {
         return Err(BufferTransferError::Range);
     }
@@ -146,8 +160,14 @@ pub fn read_shared_buffer(
 /// Why an exact four-byte-per-pixel texture transfer could not complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureTransferError {
+    /// The supplied texture is not CPU-accessible shared storage.
+    UnsupportedStorage,
+    /// The supplied texture is not one ordinary two-dimensional image.
+    UnsupportedTextureType,
     /// The texture format is not one of the exact supported four-byte color encodings.
     UnsupportedFormat,
+    /// The requested mip level does not exist.
+    Level,
     /// The requested origin or extent lies outside the texture.
     Region,
     /// The byte slice length is not exactly four bytes per requested pixel.
@@ -166,20 +186,33 @@ fn supports_four_byte_color(format: MTLPixelFormat) -> bool {
 
 fn checked_rgba8_region(
     texture: &ProtocolObject<dyn MTLTexture>,
+    level: usize,
     origin: [usize; 2],
     extent: [usize; 2],
     byte_len: usize,
 ) -> Result<(MTLRegion, usize), TextureTransferError> {
+    if texture.storageMode() != MTLStorageMode::Shared {
+        return Err(TextureTransferError::UnsupportedStorage);
+    }
+    if texture.textureType() != MTLTextureType::Type2D {
+        return Err(TextureTransferError::UnsupportedTextureType);
+    }
     if !supports_four_byte_color(texture.pixelFormat()) {
         return Err(TextureTransferError::UnsupportedFormat);
     }
+    if level >= texture.mipmapLevelCount() {
+        return Err(TextureTransferError::Level);
+    }
+    let shift = u32::try_from(level).map_err(|_| TextureTransferError::Level)?;
+    let level_width = texture.width().checked_shr(shift).unwrap_or(0).max(1);
+    let level_height = texture.height().checked_shr(shift).unwrap_or(0).max(1);
     let end_x = origin[0]
         .checked_add(extent[0])
         .ok_or(TextureTransferError::Region)?;
     let end_y = origin[1]
         .checked_add(extent[1])
         .ok_or(TextureTransferError::Region)?;
-    if extent.contains(&0) || end_x > texture.width() || end_y > texture.height() {
+    if extent.contains(&0) || end_x > level_width || end_y > level_height {
         return Err(TextureTransferError::Region);
     }
     let bytes_per_row = extent[0]
@@ -216,7 +249,8 @@ pub fn replace_texture_rgba8(
     extent: [usize; 2],
     bytes: &[u8],
 ) -> Result<(), TextureTransferError> {
-    let (region, bytes_per_row) = checked_rgba8_region(texture, origin, extent, bytes.len())?;
+    let (region, bytes_per_row) =
+        checked_rgba8_region(texture, level, origin, extent, bytes.len())?;
     let pointer = NonNull::from(bytes).cast::<c_void>();
     // SAFETY: validation above proves the pointer supplies the exact byte interval Metal reads for
     // this four-byte-per-pixel region and row stride during the synchronous copy.
@@ -242,7 +276,7 @@ pub fn read_texture_rgba8(
         .checked_mul(extent[1])
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(TextureTransferError::ByteCount)?;
-    let (region, bytes_per_row) = checked_rgba8_region(texture, origin, extent, byte_len)?;
+    let (region, bytes_per_row) = checked_rgba8_region(texture, level, origin, extent, byte_len)?;
     let mut bytes = vec![0; byte_len];
     let pointer = NonNull::from(bytes.as_mut_slice()).cast::<c_void>();
     // SAFETY: validation above proves the destination supplies the exact writable byte interval
@@ -388,6 +422,18 @@ mod tests {
         assert_eq!(
             read_shared_buffer(&buffer, 3..initial.len() + 1),
             Err(BufferTransferError::Range)
+        );
+
+        let private = device
+            .newBufferWithLength_options(initial.len(), MTLResourceOptions::StorageModePrivate)
+            .expect("private allocation works");
+        assert_eq!(
+            write_shared_buffer(&private, 0, &initial),
+            Err(BufferTransferError::UnsupportedStorage)
+        );
+        assert_eq!(
+            read_shared_buffer(&private, 0..initial.len()),
+            Err(BufferTransferError::UnsupportedStorage)
         );
     }
 }

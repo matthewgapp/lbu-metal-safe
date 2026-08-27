@@ -2,8 +2,17 @@
 //!
 //! The generated `objc2-metal` API is already safe for ordinary object operations. This crate owns
 //! only the operations whose platform signatures necessarily contain raw window handles, raw byte
-//! pointers, or Objective-C block pointers. It deliberately exposes no renderer, command graph,
-//! scene, shader, pipeline, fallback, or API-selection abstraction.
+//! pointers, Objective-C block pointers, or unchecked Metal argument indices. It deliberately
+//! exposes no renderer, command graph, scene, shader, fallback, or API-selection abstraction.
+
+mod render;
+
+pub use render::{
+    BoundVertexRecords, ColorLoad, ColorStore, PendingPresentedRender, RenderCommandBuffer,
+    RenderCommandError, RenderPassDescriptor, RenderPipelineAttachmentError, Texture2DMips,
+    Texture2DStorage, Texture2DUse, TextureAllocationError, new_texture_2d,
+    render_pipeline_color_attachment,
+};
 
 use std::ffi::c_void;
 use std::ops::Range;

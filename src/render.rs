@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::ptr::{NonNull, addr_eq};
+use std::time::Duration;
 
 use objc2::Message;
 use objc2::rc::Retained;
@@ -88,6 +89,22 @@ pub enum RenderExecutionStatus {
     Error,
     /// The linked SDK reported a status outside the currently known Metal lifecycle.
     Unknown,
+}
+
+/// Device execution time reported for one completed Metal command buffer.
+///
+/// This is inert timing evidence. It does not expose a queue, command buffer, encoder, drawable,
+/// or synchronization operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderExecutionTiming {
+    device: Duration,
+}
+
+impl RenderExecutionTiming {
+    /// Time between Metal beginning and ending this command buffer on the GPU.
+    pub const fn device(self) -> Duration {
+        self.device
+    }
 }
 
 impl RenderExecutionStatus {
@@ -710,6 +727,20 @@ impl PendingPresentedRender {
         RenderExecutionStatus::from_metal(self.command_buffer.status())
     }
 
+    /// Returns device execution timing after Metal has completed the command buffer.
+    ///
+    /// Metal reports zero timestamps until the corresponding event is available. Invalid or
+    /// incomplete platform evidence remains `None` instead of being guessed from CPU time.
+    pub fn execution_timing(&self) -> Option<RenderExecutionTiming> {
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        execution_timing(
+            self.command_buffer.GPUStartTime(),
+            self.command_buffer.GPUEndTime(),
+        )
+    }
+
     /// Polls without blocking for exact drawable presentation and command-buffer success.
     pub fn try_complete(&mut self) -> Result<PresentedDrawableProgress, RenderCommandError> {
         let camera_drawable: &ProtocolObject<dyn CAMetalDrawable> = &self._drawable;
@@ -728,6 +759,15 @@ impl PendingPresentedRender {
     }
 }
 
+fn execution_timing(start: f64, end: f64) -> Option<RenderExecutionTiming> {
+    if !start.is_finite() || !end.is_finite() || start <= 0.0 || end < start {
+        return None;
+    }
+    Some(RenderExecutionTiming {
+        device: Duration::try_from_secs_f64(end - start).ok()?,
+    })
+}
+
 fn check_buffer_argument(index: usize) -> Result<(), RenderCommandError> {
     if index >= BUFFER_ARGUMENT_COUNT {
         Err(RenderCommandError::BufferArgumentIndex)
@@ -741,5 +781,22 @@ fn check_inline_bytes(bytes: &[u8]) -> Result<(), RenderCommandError> {
         Err(RenderCommandError::InlineByteCount)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::execution_timing;
+    use std::time::Duration;
+
+    #[test]
+    fn accepts_only_completed_monotonic_device_interval() {
+        assert_eq!(
+            execution_timing(10.25, 11.25).map(|timing| timing.device()),
+            Some(Duration::from_secs(1))
+        );
+        assert!(execution_timing(0.0, 1.0).is_none());
+        assert!(execution_timing(2.0, 1.0).is_none());
+        assert!(execution_timing(f64::NAN, 1.0).is_none());
     }
 }

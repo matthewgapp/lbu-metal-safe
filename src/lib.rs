@@ -166,14 +166,14 @@ pub fn read_shared_buffer(
     Ok(bytes)
 }
 
-/// Why an exact four-byte-per-pixel texture transfer could not complete.
+/// Why an exact supported texture transfer could not complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureTransferError {
     /// The supplied texture is not CPU-accessible shared storage.
     UnsupportedStorage,
     /// The supplied texture is not one ordinary two-dimensional image.
     UnsupportedTextureType,
-    /// The texture format is not one of the exact supported four-byte color encodings.
+    /// The texture format does not match the exact requested transfer encoding.
     UnsupportedFormat,
     /// The requested mip level does not exist.
     Level,
@@ -193,11 +193,34 @@ fn supports_four_byte_color(format: MTLPixelFormat) -> bool {
     )
 }
 
-fn checked_rgba8_region(
+#[derive(Clone, Copy)]
+enum TextureTransferEncoding {
+    Rgba8,
+    Rgba32Uint,
+}
+
+impl TextureTransferEncoding {
+    const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgba8 => 4,
+            Self::Rgba32Uint => std::mem::size_of::<[u32; 4]>(),
+        }
+    }
+
+    fn supports(self, format: MTLPixelFormat) -> bool {
+        match self {
+            Self::Rgba8 => supports_four_byte_color(format),
+            Self::Rgba32Uint => format == MTLPixelFormat::RGBA32Uint,
+        }
+    }
+}
+
+fn checked_texture_region(
     texture: &ProtocolObject<dyn MTLTexture>,
     level: usize,
     origin: [usize; 2],
     extent: [usize; 2],
+    encoding: TextureTransferEncoding,
     byte_len: usize,
 ) -> Result<(MTLRegion, usize), TextureTransferError> {
     if texture.storageMode() != MTLStorageMode::Shared {
@@ -206,7 +229,7 @@ fn checked_rgba8_region(
     if texture.textureType() != MTLTextureType::Type2D {
         return Err(TextureTransferError::UnsupportedTextureType);
     }
-    if !supports_four_byte_color(texture.pixelFormat()) {
+    if !encoding.supports(texture.pixelFormat()) {
         return Err(TextureTransferError::UnsupportedFormat);
     }
     if level >= texture.mipmapLevelCount() {
@@ -225,7 +248,7 @@ fn checked_rgba8_region(
         return Err(TextureTransferError::Region);
     }
     let bytes_per_row = extent[0]
-        .checked_mul(4)
+        .checked_mul(encoding.bytes_per_pixel())
         .ok_or(TextureTransferError::ByteCount)?;
     let required = bytes_per_row
         .checked_mul(extent[1])
@@ -258,8 +281,14 @@ pub fn replace_texture_rgba8(
     extent: [usize; 2],
     bytes: &[u8],
 ) -> Result<(), TextureTransferError> {
-    let (region, bytes_per_row) =
-        checked_rgba8_region(texture, level, origin, extent, bytes.len())?;
+    let (region, bytes_per_row) = checked_texture_region(
+        texture,
+        level,
+        origin,
+        extent,
+        TextureTransferEncoding::Rgba8,
+        bytes.len(),
+    )?;
     let pointer = NonNull::from(bytes).cast::<c_void>();
     // SAFETY: validation above proves the pointer supplies the exact byte interval Metal reads for
     // this four-byte-per-pixel region and row stride during the synchronous copy.
@@ -285,7 +314,14 @@ pub fn read_texture_rgba8(
         .checked_mul(extent[1])
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(TextureTransferError::ByteCount)?;
-    let (region, bytes_per_row) = checked_rgba8_region(texture, level, origin, extent, byte_len)?;
+    let (region, bytes_per_row) = checked_texture_region(
+        texture,
+        level,
+        origin,
+        extent,
+        TextureTransferEncoding::Rgba8,
+        byte_len,
+    )?;
     let mut bytes = vec![0; byte_len];
     let pointer = NonNull::from(bytes.as_mut_slice()).cast::<c_void>();
     // SAFETY: validation above proves the destination supplies the exact writable byte interval
@@ -294,6 +330,81 @@ pub fn read_texture_rgba8(
         texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(pointer, bytes_per_row, region, level)
     };
     Ok(bytes)
+}
+
+/// Reads one exact two-dimensional four-channel `u32` texture region.
+///
+/// The result is tightly packed in increasing texture-coordinate row-major order. No format
+/// conversion, row padding, or implementation-defined integer normalization is permitted at this
+/// boundary.
+pub fn read_texture_rgba32_u32(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    level: usize,
+    origin: [usize; 2],
+    extent: [usize; 2],
+) -> Result<Vec<[u32; 4]>, TextureTransferError> {
+    let pixel_count = extent[0]
+        .checked_mul(extent[1])
+        .ok_or(TextureTransferError::ByteCount)?;
+    let byte_len = pixel_count
+        .checked_mul(std::mem::size_of::<[u32; 4]>())
+        .ok_or(TextureTransferError::ByteCount)?;
+    let (region, bytes_per_row) = checked_texture_region(
+        texture,
+        level,
+        origin,
+        extent,
+        TextureTransferEncoding::Rgba32Uint,
+        byte_len,
+    )?;
+    let mut words = vec![[0_u32; 4]; pixel_count];
+    let pointer = NonNull::from(words.as_mut_slice()).cast::<c_void>();
+    // SAFETY: the checks above prove that `words` supplies the exact writable byte interval Metal
+    // fills for this ordinary shared `RGBA32Uint` region and tightly packed row stride.
+    unsafe {
+        texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(pointer, bytes_per_row, region, level)
+    };
+    Ok(words)
+}
+
+/// Replaces one exact two-dimensional four-channel `u32` texture region.
+pub fn replace_texture_rgba32_u32(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    level: usize,
+    origin: [usize; 2],
+    extent: [usize; 2],
+    words: &[[u32; 4]],
+) -> Result<(), TextureTransferError> {
+    let pixel_count = extent[0]
+        .checked_mul(extent[1])
+        .ok_or(TextureTransferError::ByteCount)?;
+    if words.len() != pixel_count {
+        return Err(TextureTransferError::ByteCount);
+    }
+    let byte_len = words
+        .len()
+        .checked_mul(std::mem::size_of::<[u32; 4]>())
+        .ok_or(TextureTransferError::ByteCount)?;
+    let (region, bytes_per_row) = checked_texture_region(
+        texture,
+        level,
+        origin,
+        extent,
+        TextureTransferEncoding::Rgba32Uint,
+        byte_len,
+    )?;
+    let pointer = NonNull::from(words).cast::<c_void>();
+    // SAFETY: the checks above prove that `words` supplies the exact readable byte interval Metal
+    // consumes for this ordinary shared `RGBA32Uint` region and tightly packed row stride.
+    unsafe {
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+            region,
+            level,
+            pointer,
+            bytes_per_row,
+        )
+    };
+    Ok(())
 }
 
 /// Terminal evidence reported for the exact drawable registered with Metal.
@@ -443,6 +554,37 @@ mod tests {
         assert_eq!(
             read_shared_buffer(&private, 0..initial.len()),
             Err(BufferTransferError::UnsupportedStorage)
+        );
+    }
+
+    #[test]
+    fn metal_shared_rgba32_u32_round_trip_is_exact_and_shape_checked() {
+        let device = MTLCreateSystemDefaultDevice().expect("test host has a Metal device");
+        let texture = new_texture_2d(
+            &device,
+            2,
+            2,
+            MTLPixelFormat::RGBA32Uint,
+            Texture2DStorage::Shared,
+            Texture2DUse::RenderTarget,
+            Texture2DMips::One,
+        )
+        .expect("integer texture allocation works");
+        let words = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [u32::MAX, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        replace_texture_rgba32_u32(&texture, 0, [0, 0], [2, 2], &words)
+            .expect("integer replacement works");
+        assert_eq!(
+            read_texture_rgba32_u32(&texture, 0, [0, 0], [2, 2]).expect("integer readback works"),
+            words
+        );
+        assert_eq!(
+            replace_texture_rgba32_u32(&texture, 0, [0, 0], [2, 2], &words[..3]),
+            Err(TextureTransferError::ByteCount)
         );
     }
 }

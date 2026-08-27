@@ -96,6 +96,7 @@ pub fn new_texture_2d(
             | MTLPixelFormat::RGBA8Unorm_sRGB
             | MTLPixelFormat::BGRA8Unorm
             | MTLPixelFormat::BGRA8Unorm_sRGB
+            | MTLPixelFormat::RGBA32Uint
             | MTLPixelFormat::RGBA16Float
             | MTLPixelFormat::Depth32Float
     ) {

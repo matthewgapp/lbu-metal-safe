@@ -1,0 +1,43 @@
+[package]
+name = "lbu-metal-safe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Narrow safe Rust boundary for LBU direct Metal presentation"
+repository = "https://github.com/matthewgapp/lbu-metal-safe"
+
+[dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+raw-window-handle = "0.6.2"
+raw-window-metal = "1.1.0"
+
+[dependencies.objc2-metal]
+version = "0.3.2"
+default-features = false
+features = [
+    "block2",
+    "objc2-core-foundation",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "MTLTypes",
+]
+
+[dependencies.objc2-quartz-core]
+version = "0.3.2"
+default-features = false
+features = ["objc2-metal", "CALayer", "CAMetalLayer"]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

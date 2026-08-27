@@ -455,6 +455,8 @@ type PresentedBlock = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLDrawable>>) +
 pub struct PresentedDrawableCompletion {
     receiver: mpsc::Receiver<Result<PresentedDrawable, PresentedDrawableError>>,
     _block: PresentedBlock,
+    expected_address: NonNull<()>,
+    expected_id: usize,
     completed: bool,
 }
 
@@ -475,6 +477,31 @@ impl PresentedDrawableCompletion {
                 Err(PresentedDrawableError::Cancelled)
             }
         }
+    }
+
+    fn try_complete_or_observe(
+        &mut self,
+        drawable: &ProtocolObject<dyn MTLDrawable>,
+    ) -> Result<PresentedDrawableProgress, PresentedDrawableError> {
+        let progress = self.try_complete()?;
+        if !matches!(progress, PresentedDrawableProgress::Pending) {
+            return Ok(progress);
+        }
+        let actual_address = NonNull::from(drawable).cast::<()>();
+        let actual_id = drawable.drawableID();
+        if actual_address != self.expected_address || actual_id != self.expected_id {
+            self.completed = true;
+            return Err(PresentedDrawableError::Identity);
+        }
+        let presented_time = drawable.presentedTime();
+        if !presented_time.is_finite() || presented_time <= 0.0 {
+            return Ok(PresentedDrawableProgress::Pending);
+        }
+        self.completed = true;
+        Ok(PresentedDrawableProgress::Presented(PresentedDrawable {
+            drawable_id: actual_id,
+            presented_time,
+        }))
     }
 }
 
@@ -510,6 +537,8 @@ pub fn register_presented_drawable(
     PresentedDrawableCompletion {
         receiver,
         _block: block,
+        expected_address,
+        expected_id,
         completed: false,
     }
 }

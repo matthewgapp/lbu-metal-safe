@@ -9,8 +9,8 @@ mod render;
 
 pub use render::{
     BoundVertexRecords, ColorLoad, ColorStore, PendingPresentedRender, RenderCommandBuffer,
-    RenderCommandError, RenderPassDescriptor, RenderPipelineAttachmentError, Texture2DMips,
-    Texture2DStorage, Texture2DUse, TextureAllocationError, new_texture_2d,
+    RenderCommandError, RenderExecutionStatus, RenderPassDescriptor, RenderPipelineAttachmentError,
+    Texture2DMips, Texture2DStorage, Texture2DUse, TextureAllocationError, new_texture_2d,
     render_pipeline_color_attachment,
 };
 

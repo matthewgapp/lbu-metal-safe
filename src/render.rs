@@ -71,6 +71,39 @@ pub enum TextureAllocationError {
     Allocation,
 }
 
+/// Inert lifecycle state reported by Metal for one retained command buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderExecutionStatus {
+    /// The command buffer has not entered its queue.
+    NotEnqueued,
+    /// The command buffer is queued but not yet committed.
+    Enqueued,
+    /// The command buffer is committed but not yet scheduled on the device.
+    Committed,
+    /// The device scheduled the command buffer and work may still be executing.
+    Scheduled,
+    /// Every encoded command completed successfully.
+    Completed,
+    /// Metal terminally failed the command buffer.
+    Error,
+    /// The linked SDK reported a status outside the currently known Metal lifecycle.
+    Unknown,
+}
+
+impl RenderExecutionStatus {
+    fn from_metal(value: MTLCommandBufferStatus) -> Self {
+        match value {
+            MTLCommandBufferStatus::NotEnqueued => Self::NotEnqueued,
+            MTLCommandBufferStatus::Enqueued => Self::Enqueued,
+            MTLCommandBufferStatus::Committed => Self::Committed,
+            MTLCommandBufferStatus::Scheduled => Self::Scheduled,
+            MTLCommandBufferStatus::Completed => Self::Completed,
+            MTLCommandBufferStatus::Error => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Allocates one ordinary non-mipmapped two-dimensional texture from checked exact properties.
 pub fn new_texture_2d(
     device: &ProtocolObject<dyn MTLDevice>,
@@ -672,6 +705,11 @@ pub struct PendingPresentedRender {
 }
 
 impl PendingPresentedRender {
+    /// Current inert Metal execution state without consuming presentation completion evidence.
+    pub fn execution_status(&self) -> RenderExecutionStatus {
+        RenderExecutionStatus::from_metal(self.command_buffer.status())
+    }
+
     /// Polls without blocking for exact drawable presentation and command-buffer success.
     pub fn try_complete(&mut self) -> Result<PresentedDrawableProgress, RenderCommandError> {
         let progress = self

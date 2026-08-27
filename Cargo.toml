@@ -22,10 +22,18 @@ features = [
     "objc2-core-foundation",
     "MTLAllocation",
     "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLDepthStencil",
     "MTLDevice",
     "MTLDrawable",
     "MTLPixelFormat",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPass",
+    "MTLRenderPipeline",
     "MTLResource",
+    "MTLSampler",
     "MTLTexture",
     "MTLTypes",
 ]
@@ -34,6 +42,9 @@ features = [
 version = "0.3.2"
 default-features = false
 features = ["objc2-metal", "CALayer", "CAMetalLayer"]
+
+[dev-dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
 
 [lints.rust]
 missing_docs = "deny"

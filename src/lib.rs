@@ -28,9 +28,97 @@ use objc2_metal::{
     MTLBuffer, MTLDevice, MTLDrawable, MTLPixelFormat, MTLRegion, MTLResource, MTLResourceOptions,
     MTLStorageMode, MTLTexture, MTLTextureType,
 };
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle};
 use raw_window_metal::Layer;
+
+/// Why one immutable drawable-generation identity could not be minted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrawablePresentationGenerationError {
+    /// The supplied extent was zero or differed from the exact layer drawable extent.
+    Extent,
+    /// The supplied external host generation was zero.
+    Identity,
+}
+
+/// Opaque identity of one exact host-qualified Metal layer configuration.
+///
+/// Only the owning window/presenter observes every physical configuration mutation, so it supplies
+/// the nonzero monotonic epoch. That epoch must advance for every mutation, including one that later
+/// returns to an earlier extent. This boundary validates the retained layer, extent, drawable, and
+/// exact equality of the host identity without pretending to own QuartzCore configuration.
+#[derive(Clone)]
+pub struct DrawablePresentationGeneration {
+    layer: Retained<CAMetalLayer>,
+    external_epoch: u64,
+    width: u32,
+    height: u32,
+}
+
+impl DrawablePresentationGeneration {
+    /// Binds one retained layer and current extent to a nonzero host-owned physical epoch.
+    pub fn try_new(
+        layer: Retained<CAMetalLayer>,
+        width: u32,
+        height: u32,
+        external_epoch: u64,
+    ) -> Result<Self, DrawablePresentationGenerationError> {
+        if external_epoch == 0 {
+            return Err(DrawablePresentationGenerationError::Identity);
+        }
+        let size = layer.drawableSize();
+        if width == 0
+            || height == 0
+            || size.width != f64::from(width)
+            || size.height != f64::from(height)
+        {
+            return Err(DrawablePresentationGenerationError::Extent);
+        }
+        Ok(Self {
+            layer,
+            external_epoch,
+            width,
+            height,
+        })
+    }
+
+    pub(crate) fn matches_drawable(&self, drawable: &ProtocolObject<dyn CAMetalDrawable>) -> bool {
+        let layer = drawable.layer();
+        let layer_ref: &CAMetalLayer = &layer;
+        let retained_layer_ref: &CAMetalLayer = &self.layer;
+        let size = layer.drawableSize();
+        let texture = drawable.texture();
+        std::ptr::eq(layer_ref, retained_layer_ref)
+            && size.width == f64::from(self.width)
+            && size.height == f64::from(self.height)
+            && texture.width() == self.width as usize
+            && texture.height() == self.height as usize
+    }
+}
+
+impl std::fmt::Debug for DrawablePresentationGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DrawablePresentationGeneration")
+            .field("external_epoch", &self.external_epoch)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for DrawablePresentationGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        let self_layer: &CAMetalLayer = &self.layer;
+        let other_layer: &CAMetalLayer = &other.layer;
+        std::ptr::eq(self_layer, other_layer)
+            && self.external_epoch == other.external_epoch
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl Eq for DrawablePresentationGeneration {}
 
 /// Failure to obtain a Metal layer from one live borrowed window.
 #[derive(Debug)]
@@ -561,6 +649,20 @@ mod tests {
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
     use super::*;
+
+    #[test]
+    fn external_epoch_keeps_returned_extent_distinct() {
+        let layer = CAMetalLayer::new();
+        let mut extent = layer.drawableSize();
+        extent.width = 96.0;
+        extent.height = 96.0;
+        layer.setDrawableSize(extent);
+        let first = DrawablePresentationGeneration::try_new(layer.clone(), 96, 96, 1)
+            .expect("first external epoch is admitted");
+        let returned = DrawablePresentationGeneration::try_new(layer, 96, 96, 3)
+            .expect("returned extent carries its later external epoch");
+        assert_ne!(first, returned);
+    }
 
     #[test]
     fn metal_shared_buffer_round_trip_is_exact_and_range_checked() {

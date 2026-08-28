@@ -22,8 +22,8 @@ use objc2_metal::{
 use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
-    PresentedDrawableCompletion, PresentedDrawableError, PresentedDrawableProgress,
-    register_presented_drawable, register_presented_drawable_with_wake,
+    DrawablePresentationGeneration, PresentedDrawableCompletion, PresentedDrawableError,
+    PresentedDrawableProgress, register_presented_drawable, register_presented_drawable_with_wake,
 };
 
 const COLOR_ATTACHMENT_COUNT: usize = 8;
@@ -210,6 +210,8 @@ pub enum RenderCommandError {
     DrawRange,
     /// The supplied drawable texture was not rendered by this exact command buffer.
     DrawableTarget,
+    /// The drawable did not belong to the exact supplied layer configuration identity.
+    DrawableGeneration,
     /// Metal completed the command buffer in a non-success state.
     Execution(MTLCommandBufferStatus),
     /// Metal did not report valid terminal evidence for the exact drawable.
@@ -449,7 +451,7 @@ impl RenderCommandBuffer {
         self,
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, None, None)
+        self.present_with_options(drawable, None, None, None)
     }
 
     /// Commits this command buffer, presents its exact drawable, and invokes `wake` after Metal
@@ -462,7 +464,26 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, None, Some(Arc::new(wake)))
+        self.present_with_options(drawable, None, Some(Arc::new(wake)), None)
+    }
+
+    /// Commits and presents one exact drawable qualified by one immutable layer generation.
+    pub fn present_for_generation(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        generation: &DrawablePresentationGeneration,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_options(drawable, None, None, Some(generation))
+    }
+
+    /// Presents one generation-qualified drawable and invokes `wake` after terminal evidence.
+    pub fn present_for_generation_with_wake(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        generation: &DrawablePresentationGeneration,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_options(drawable, None, Some(Arc::new(wake)), Some(generation))
     }
 
     /// Commits this command buffer and presents its exact drawable only after the preceding
@@ -476,7 +497,7 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         minimum_duration: Duration,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, Some(minimum_duration), None)
+        self.present_with_options(drawable, Some(minimum_duration), None, None)
     }
 
     /// Commits a minimum-duration presentation and invokes `wake` after Metal reports terminal
@@ -490,7 +511,7 @@ impl RenderCommandBuffer {
         minimum_duration: Duration,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, Some(minimum_duration), Some(Arc::new(wake)))
+        self.present_with_options(drawable, Some(minimum_duration), Some(Arc::new(wake)), None)
     }
 
     fn present_with_options(
@@ -498,6 +519,7 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         minimum_duration: Option<Duration>,
         wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+        generation: Option<&DrawablePresentationGeneration>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
         let drawable_texture = drawable.texture();
         let drawable_texture_ref: &ProtocolObject<dyn MTLTexture> = &drawable_texture;
@@ -508,6 +530,9 @@ impl RenderCommandBuffer {
             .any(|target| addr_eq(target.as_ptr(), drawable_address.as_ptr()))
         {
             return Err(RenderCommandError::DrawableTarget);
+        }
+        if generation.is_some_and(|generation| !generation.matches_drawable(&drawable)) {
+            return Err(RenderCommandError::DrawableGeneration);
         }
         let camera_drawable: &ProtocolObject<dyn CAMetalDrawable> = &drawable;
         let metal_drawable: &ProtocolObject<dyn MTLDrawable> = camera_drawable.as_ref();

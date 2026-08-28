@@ -449,7 +449,7 @@ impl RenderCommandBuffer {
         self,
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_optional_wake(drawable, None)
+        self.present_with_options(drawable, None, None)
     }
 
     /// Commits this command buffer, presents its exact drawable, and invokes `wake` after Metal
@@ -462,12 +462,41 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_optional_wake(drawable, Some(Arc::new(wake)))
+        self.present_with_options(drawable, None, Some(Arc::new(wake)))
     }
 
-    fn present_with_optional_wake(
+    /// Commits this command buffer and presents its exact drawable only after the preceding
+    /// drawable has remained visible for at least `minimum_duration`.
+    ///
+    /// Metal computes the target from the preceding drawable's actual presentation time. This is
+    /// the safe scheduling primitive for distinct queued frames; callers must still consume exact
+    /// terminal evidence from [`PendingPresentedRender::try_complete`].
+    pub fn present_after_minimum_duration(
         self,
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        minimum_duration: Duration,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_options(drawable, Some(minimum_duration), None)
+    }
+
+    /// Commits a minimum-duration presentation and invokes `wake` after Metal reports terminal
+    /// evidence for the exact drawable.
+    ///
+    /// Notification remains non-authoritative: only [`PendingPresentedRender::try_complete`]
+    /// consumes the registered drawable evidence.
+    pub fn present_after_minimum_duration_with_wake(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        minimum_duration: Duration,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_options(drawable, Some(minimum_duration), Some(Arc::new(wake)))
+    }
+
+    fn present_with_options(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        minimum_duration: Option<Duration>,
         wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
         let drawable_texture = drawable.texture();
@@ -486,7 +515,12 @@ impl RenderCommandBuffer {
             Some(wake) => register_presented_drawable_with_wake(metal_drawable, Some(wake)),
             None => register_presented_drawable(metal_drawable),
         };
-        self.raw.presentDrawable(metal_drawable);
+        match minimum_duration {
+            Some(duration) => self
+                .raw
+                .presentDrawable_afterMinimumDuration(metal_drawable, duration.as_secs_f64()),
+            None => self.raw.presentDrawable(metal_drawable),
+        }
         self.raw.commit();
         Ok(PendingPresentedRender {
             completion,

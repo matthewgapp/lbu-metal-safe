@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::ptr::{NonNull, addr_eq};
+use std::sync::Arc;
 use std::time::Duration;
 
 use objc2::Message;
@@ -22,7 +23,7 @@ use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
     PresentedDrawableCompletion, PresentedDrawableError, PresentedDrawableProgress,
-    register_presented_drawable,
+    register_presented_drawable, register_presented_drawable_with_wake,
 };
 
 const COLOR_ATTACHMENT_COUNT: usize = 8;
@@ -448,6 +449,27 @@ impl RenderCommandBuffer {
         self,
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_optional_wake(drawable, None)
+    }
+
+    /// Commits this command buffer, presents its exact drawable, and invokes `wake` after Metal
+    /// reports terminal presentation evidence.
+    ///
+    /// The notification does not weaken terminal evidence: callers must still consume
+    /// [`PendingPresentedRender::try_complete`] before treating the drawable as presented.
+    pub fn present_with_wake(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_optional_wake(drawable, Some(Arc::new(wake)))
+    }
+
+    fn present_with_optional_wake(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
         let drawable_texture = drawable.texture();
         let drawable_texture_ref: &ProtocolObject<dyn MTLTexture> = &drawable_texture;
         let drawable_address = NonNull::from(drawable_texture_ref).cast::<()>();
@@ -460,7 +482,10 @@ impl RenderCommandBuffer {
         }
         let camera_drawable: &ProtocolObject<dyn CAMetalDrawable> = &drawable;
         let metal_drawable: &ProtocolObject<dyn MTLDrawable> = camera_drawable.as_ref();
-        let completion = register_presented_drawable(metal_drawable);
+        let completion = match wake {
+            Some(wake) => register_presented_drawable_with_wake(metal_drawable, Some(wake)),
+            None => register_presented_drawable(metal_drawable),
+        };
         self.raw.presentDrawable(metal_drawable);
         self.raw.commit();
         Ok(PendingPresentedRender {

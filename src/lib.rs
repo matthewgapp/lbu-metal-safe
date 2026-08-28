@@ -16,8 +16,9 @@ pub use render::{
 
 use std::ffi::c_void;
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use block2::RcBlock;
 use objc2::MainThreadMarker;
@@ -509,6 +510,13 @@ impl PresentedDrawableCompletion {
 pub fn register_presented_drawable(
     drawable: &ProtocolObject<dyn MTLDrawable>,
 ) -> PresentedDrawableCompletion {
+    register_presented_drawable_with_wake(drawable, None)
+}
+
+pub(crate) fn register_presented_drawable_with_wake(
+    drawable: &ProtocolObject<dyn MTLDrawable>,
+    wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+) -> PresentedDrawableCompletion {
     let expected_address = NonNull::from(drawable).cast::<()>();
     let expected_id = drawable.drawableID();
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -530,6 +538,11 @@ pub fn register_presented_drawable(
             })
         };
         let _ = sender.try_send(result);
+        if let Some(wake) = wake.as_ref() {
+            // A caller panic must never unwind through Metal's Objective-C callback frame. The
+            // completion result remains available to ordinary polling when notification fails.
+            let _ = catch_unwind(AssertUnwindSafe(|| wake()));
+        }
     });
     // SAFETY: the heap-owned block remains alive in `PresentedDrawableCompletion`; its signature
     // exactly matches `MTLDrawablePresentedHandler`, and Metal copies/retains registered handlers.

@@ -1,10 +1,13 @@
 //! Real-device proof for checked render encoding, bounds, and offscreen pixels.
 
+use std::sync::mpsc;
+use std::time::Duration;
+
 use lbu_metal_safe::{
-    ColorLoad, ColorStore, RenderCommandBuffer, RenderCommandError, RenderPassDescriptor,
-    RenderPipelineAttachmentError, Texture2DMips, Texture2DStorage, Texture2DUse,
-    TextureAllocationError, new_texture_2d, read_texture_rgba8, render_pipeline_color_attachment,
-    shared_buffer_with_bytes,
+    ColorLoad, ColorStore, PendingRenderProgress, RenderCommandBuffer, RenderCommandError,
+    RenderExecutionStatus, RenderPassDescriptor, RenderPipelineAttachmentError, Texture2DMips,
+    Texture2DStorage, Texture2DUse, TextureAllocationError, new_texture_2d, read_texture_rgba8,
+    render_pipeline_color_attachment, shared_buffer_with_bytes,
 };
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -217,4 +220,33 @@ fn metal_render_transaction_draws_exact_checked_triangle() {
         pixels[center + 3]
     );
     assert_eq!(&pixels[0..4], &[0, 0, 0, 255]);
+
+    let mut clear = RenderPassDescriptor::new();
+    clear
+        .set_color_attachment(
+            0,
+            &target,
+            ColorLoad::Clear([0.0, 0.0, 1.0, 1.0]),
+            ColorStore::Store,
+        )
+        .expect("private completion target is valid");
+    let mut command = RenderCommandBuffer::new(&queue).expect("command buffer allocation works");
+    command
+        .begin_render_pass(&clear)
+        .expect("clear pass begins")
+        .end();
+    let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
+    let pending = command.commit_with_wake(move || {
+        let _ = wake_sender.try_send(());
+    });
+    wake_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("private completion wakes its owner");
+    assert_eq!(pending.try_complete(), Ok(PendingRenderProgress::Completed));
+    assert_eq!(pending.execution_status(), RenderExecutionStatus::Completed);
+    assert!(pending.execution_timing().is_some());
+
+    let pixels =
+        read_texture_rgba8(&target, 0, [0, 0], [32, 32]).expect("completed target is readable");
+    assert_eq!(&pixels[0..4], &[0, 0, 255, 255]);
 }

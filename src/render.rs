@@ -3,10 +3,12 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{NonNull, addr_eq};
 use std::sync::Arc;
 use std::time::Duration;
 
+use block2::RcBlock;
 use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -90,6 +92,16 @@ pub enum RenderExecutionStatus {
     Error,
     /// The linked SDK reported a status outside the currently known Metal lifecycle.
     Unknown,
+}
+
+/// Nonblocking completion state of one committed non-presenting render submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "pending private render work must continue to be polled"]
+pub enum PendingRenderProgress {
+    /// The exact command buffer has not yet completed on the device.
+    Pending,
+    /// Every encoded command completed successfully.
+    Completed,
 }
 
 /// Device execution time reported for one completed Metal command buffer.
@@ -391,6 +403,24 @@ pub struct RenderCommandBuffer {
     depth_states: Vec<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
 }
 
+type CommandCompletedBlock =
+    RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLCommandBuffer>>) + 'static>;
+
+/// One committed non-presenting render submission retaining every encoded resource.
+///
+/// Completion is inert prerequisite evidence only. This type owns no drawable, surface,
+/// presentation, scene, or publication operation.
+#[must_use = "a committed private render must be polled to successful completion"]
+pub struct PendingRender {
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    _completion_block: Option<CommandCompletedBlock>,
+    _buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    _textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+    _samplers: Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+    _pipelines: Vec<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    _depth_states: Vec<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
+}
+
 impl RenderCommandBuffer {
     /// Creates one retained-resource command buffer from the exact supplied Metal queue.
     pub fn new(queue: &ProtocolObject<dyn MTLCommandQueue>) -> Result<Self, RenderCommandError> {
@@ -443,6 +473,48 @@ impl RenderCommandBuffer {
             Ok(())
         } else {
             Err(RenderCommandError::Execution(status))
+        }
+    }
+
+    /// Commits this exact non-presenting command buffer and retains its resources for polling.
+    pub fn commit(self) -> PendingRender {
+        self.commit_with_optional_wake(None)
+    }
+
+    /// Commits this exact non-presenting command buffer and invokes `wake` after it terminates.
+    ///
+    /// The callback is notification only. Callers must still consume
+    /// [`PendingRender::try_complete`] before using the private result.
+    pub fn commit_with_wake(self, wake: impl Fn() + Send + Sync + 'static) -> PendingRender {
+        self.commit_with_optional_wake(Some(Arc::new(wake)))
+    }
+
+    fn commit_with_optional_wake(
+        self,
+        wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) -> PendingRender {
+        let completion_block = wake.map(|wake| {
+            let block: CommandCompletedBlock = RcBlock::new(
+                move |_command: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    // A caller panic must never unwind through Metal's Objective-C callback.
+                    let _ = catch_unwind(AssertUnwindSafe(|| wake()));
+                },
+            );
+            // SAFETY: the heap-owned block is retained below for the whole pending submission;
+            // its signature exactly matches `MTLCommandBufferHandler`, and Metal also copies the
+            // registered completion handler.
+            unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
+            block
+        });
+        self.raw.commit();
+        PendingRender {
+            command_buffer: self.raw,
+            _completion_block: completion_block,
+            _buffers: self.buffers,
+            _textures: self.textures,
+            _samplers: self.samplers,
+            _pipelines: self.pipelines,
+            _depth_states: self.depth_states,
         }
     }
 
@@ -789,6 +861,36 @@ impl<'command> RenderPass<'command> {
 impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
         self.end_once();
+    }
+}
+
+impl PendingRender {
+    /// Current inert Metal execution state without consuming completion.
+    pub fn execution_status(&self) -> RenderExecutionStatus {
+        RenderExecutionStatus::from_metal(self.command_buffer.status())
+    }
+
+    /// Returns device execution timing after this exact command buffer completed successfully.
+    pub fn execution_timing(&self) -> Option<RenderExecutionTiming> {
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        execution_timing(
+            self.command_buffer.GPUStartTime(),
+            self.command_buffer.GPUEndTime(),
+        )
+    }
+
+    /// Polls without blocking for successful completion of this exact private submission.
+    pub fn try_complete(&self) -> Result<PendingRenderProgress, RenderCommandError> {
+        match self.command_buffer.status() {
+            MTLCommandBufferStatus::NotEnqueued
+            | MTLCommandBufferStatus::Enqueued
+            | MTLCommandBufferStatus::Committed
+            | MTLCommandBufferStatus::Scheduled => Ok(PendingRenderProgress::Pending),
+            MTLCommandBufferStatus::Completed => Ok(PendingRenderProgress::Completed),
+            status => Err(RenderCommandError::Execution(status)),
+        }
     }
 }
 

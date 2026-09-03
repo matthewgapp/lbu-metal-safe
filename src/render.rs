@@ -24,8 +24,9 @@ use objc2_metal::{
 use objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
-    DrawablePresentationGeneration, PresentedDrawableCompletion, PresentedDrawableError,
-    PresentedDrawableProgress, register_presented_drawable, register_presented_drawable_with_wake,
+    DrawablePresentationGeneration, DrawablePresentationObservation, PresentedDrawableCompletion,
+    PresentedDrawableError, PresentedDrawableProgress,
+    register_presented_drawable_with_observation,
 };
 
 const COLOR_ATTACHMENT_COUNT: usize = 8;
@@ -523,7 +524,7 @@ impl RenderCommandBuffer {
         self,
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, None, None, None)
+        self.present_with_options(drawable, None, None, None, None)
     }
 
     /// Commits this command buffer, presents its exact drawable, and invokes `wake` after Metal
@@ -536,7 +537,7 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, None, Some(Arc::new(wake)), None)
+        self.present_with_options(drawable, None, Some(Arc::new(wake)), None, None)
     }
 
     /// Commits and presents one exact drawable qualified by one immutable layer generation.
@@ -545,7 +546,7 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         generation: &DrawablePresentationGeneration,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, None, None, Some(generation))
+        self.present_with_options(drawable, None, None, Some(generation), None)
     }
 
     /// Presents one generation-qualified drawable and invokes `wake` after terminal evidence.
@@ -555,7 +556,36 @@ impl RenderCommandBuffer {
         generation: &DrawablePresentationGeneration,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, None, Some(Arc::new(wake)), Some(generation))
+        self.present_with_options(drawable, None, Some(Arc::new(wake)), Some(generation), None)
+    }
+
+    /// Presents a drawable into one still-live fixed-generation observation.
+    ///
+    /// The observation receives exact callback/getter evidence even after this completed attempt
+    /// is dropped. A consumed observation refuses before the command is committed. Image
+    /// equivalence and checking every submitted command remain the renderer's responsibility.
+    pub fn present_for_observation(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        observation: &DrawablePresentationObservation,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_options(drawable, None, None, None, Some(observation))
+    }
+
+    /// Presents into one fixed-generation observation and wakes after an exact callback.
+    pub fn present_for_observation_with_wake(
+        self,
+        drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+        observation: &DrawablePresentationObservation,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<PendingPresentedRender, RenderCommandError> {
+        self.present_with_options(
+            drawable,
+            None,
+            Some(Arc::new(wake)),
+            None,
+            Some(observation),
+        )
     }
 
     /// Commits this command buffer and presents its exact drawable only after the preceding
@@ -569,7 +599,7 @@ impl RenderCommandBuffer {
         drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
         minimum_duration: Duration,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, Some(minimum_duration), None, None)
+        self.present_with_options(drawable, Some(minimum_duration), None, None, None)
     }
 
     /// Commits a minimum-duration presentation and invokes `wake` after Metal reports terminal
@@ -583,7 +613,13 @@ impl RenderCommandBuffer {
         minimum_duration: Duration,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
-        self.present_with_options(drawable, Some(minimum_duration), Some(Arc::new(wake)), None)
+        self.present_with_options(
+            drawable,
+            Some(minimum_duration),
+            Some(Arc::new(wake)),
+            None,
+            None,
+        )
     }
 
     fn present_with_options(
@@ -592,7 +628,16 @@ impl RenderCommandBuffer {
         minimum_duration: Option<Duration>,
         wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
         generation: Option<&DrawablePresentationGeneration>,
+        observation: Option<&DrawablePresentationObservation>,
     ) -> Result<PendingPresentedRender, RenderCommandError> {
+        if let Some(observation) = observation {
+            observation
+                .ensure_live()
+                .map_err(RenderCommandError::Presentation)?;
+        }
+        let generation = observation
+            .map(|observation| &observation.generation)
+            .or(generation);
         let drawable_texture = drawable.texture();
         let drawable_texture_ref: &ProtocolObject<dyn MTLTexture> = &drawable_texture;
         let drawable_address = NonNull::from(drawable_texture_ref).cast::<()>();
@@ -608,10 +653,11 @@ impl RenderCommandBuffer {
         }
         let camera_drawable: &ProtocolObject<dyn CAMetalDrawable> = &drawable;
         let metal_drawable: &ProtocolObject<dyn MTLDrawable> = camera_drawable.as_ref();
-        let completion = match wake {
-            Some(wake) => register_presented_drawable_with_wake(metal_drawable, Some(wake)),
-            None => register_presented_drawable(metal_drawable),
-        };
+        let completion = register_presented_drawable_with_observation(
+            metal_drawable,
+            wake,
+            observation.map(|observation| Arc::clone(&observation.result)),
+        );
         match minimum_duration {
             Some(duration) => self
                 .raw
@@ -984,5 +1030,76 @@ mod timing_tests {
         assert!(execution_timing(0.0, 1.0).is_none());
         assert!(execution_timing(2.0, 1.0).is_none());
         assert!(execution_timing(f64::NAN, 1.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod observation_enrollment_tests {
+    use super::*;
+    use crate::{PresentedDrawable, record_observed_drawable};
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    use objc2_quartz_core::CAMetalLayer;
+
+    #[test]
+    fn consumed_and_foreign_observations_refuse_before_the_actual_command_commits() {
+        let device = MTLCreateSystemDefaultDevice().expect("test host has Metal");
+        let queue = device.newCommandQueue().expect("command queue exists");
+        let layer = CAMetalLayer::new();
+        layer.setDevice(Some(&device));
+        let mut size = layer.drawableSize();
+        size.width = 16.0;
+        size.height = 16.0;
+        layer.setDrawableSize(size);
+        let generation = DrawablePresentationGeneration::try_new(layer.clone(), 16, 16, 1)
+            .expect("exact generation exists");
+        let mut consumed = DrawablePresentationObservation::new(generation);
+        record_observed_drawable(
+            &consumed.result,
+            Ok(PresentedDrawable {
+                drawable_id: 1,
+                presented_time: 1.0,
+            }),
+        );
+        assert!(matches!(
+            consumed.try_complete(),
+            Ok(PresentedDrawableProgress::Presented(_))
+        ));
+        let drawable = layer
+            .nextDrawable()
+            .expect("real drawable allocation succeeds");
+        let command = RenderCommandBuffer::new(&queue).unwrap();
+        let raw = command.raw.clone();
+        assert_eq!(
+            command
+                .present_for_observation(drawable.clone(), &consumed)
+                .err(),
+            Some(RenderCommandError::Presentation(
+                PresentedDrawableError::AlreadyCompleted
+            )),
+        );
+        assert_eq!(raw.status(), MTLCommandBufferStatus::NotEnqueued);
+
+        let foreign_layer = CAMetalLayer::new();
+        foreign_layer.setDrawableSize(size);
+        let foreign = DrawablePresentationObservation::new(
+            DrawablePresentationGeneration::try_new(foreign_layer, 16, 16, 1).unwrap(),
+        );
+        let mut descriptor = RenderPassDescriptor::new();
+        descriptor
+            .set_color_attachment(
+                0,
+                &drawable.texture(),
+                ColorLoad::Clear([0.0; 4]),
+                ColorStore::Store,
+            )
+            .unwrap();
+        let mut command = RenderCommandBuffer::new(&queue).unwrap();
+        command.begin_render_pass(&descriptor).unwrap().end();
+        let raw = command.raw.clone();
+        assert_eq!(
+            command.present_for_observation(drawable, &foreign).err(),
+            Some(RenderCommandError::DrawableGeneration),
+        );
+        assert_eq!(raw.status(), MTLCommandBufferStatus::NotEnqueued);
     }
 }

@@ -19,7 +19,7 @@ use std::ffi::c_void;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 
 use block2::RcBlock;
 use objc2::MainThreadMarker;
@@ -539,6 +539,90 @@ pub enum PresentedDrawableProgress {
     Presented(PresentedDrawable),
 }
 
+/// One first-recorded exact drawable result for a fixed layer generation.
+///
+/// A drawable can be dropped without a presentation callback. This observation separates the
+/// evidence lifetime from individual completed render/resource handles: a later callback from a
+/// retired attempt can still supply its exact evidence. It retains no drawable or render resource.
+///
+/// This type makes no image-equivalence claim. A renderer that re-presents one logical image must
+/// keep that image immutable and independently check every command's outcome before accepting the
+/// observation. The result is the first validated result recorded, not the earliest display time.
+pub struct DrawablePresentationObservation {
+    generation: DrawablePresentationGeneration,
+    result: Arc<ObservedDrawableResult>,
+    completed: bool,
+}
+
+type ObservedDrawableResult = OnceLock<Result<PresentedDrawable, PresentedDrawableError>>;
+
+impl DrawablePresentationObservation {
+    /// Starts an independent observation bound to exactly one immutable layer generation.
+    pub fn new(generation: DrawablePresentationGeneration) -> Self {
+        Self {
+            generation,
+            result: Arc::new(OnceLock::new()),
+            completed: false,
+        }
+    }
+
+    /// Consumes the first recorded positive presentation or identity/protocol failure once.
+    ///
+    /// A per-attempt `NotPresented` result does not complete this observation. No amount of
+    /// elapsed time or command completion supplies a positive result. A callback arriving after
+    /// another result has won cannot overwrite that result.
+    pub fn try_complete(&mut self) -> Result<PresentedDrawableProgress, PresentedDrawableError> {
+        if self.completed {
+            return Err(PresentedDrawableError::AlreadyCompleted);
+        }
+        match self.result.get().copied() {
+            Some(result) => {
+                self.completed = true;
+                result.map(PresentedDrawableProgress::Presented)
+            }
+            None => Ok(PresentedDrawableProgress::Pending),
+        }
+    }
+
+    fn ensure_live(&self) -> Result<(), PresentedDrawableError> {
+        if self.completed {
+            Err(PresentedDrawableError::AlreadyCompleted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn checked_drawable_evidence(
+    expected_address: NonNull<()>,
+    expected_id: usize,
+    actual_address: NonNull<()>,
+    actual_id: usize,
+    presented_time: f64,
+) -> Result<PresentedDrawable, PresentedDrawableError> {
+    if actual_address != expected_address || actual_id != expected_id {
+        Err(PresentedDrawableError::Identity)
+    } else if !presented_time.is_finite() || presented_time <= 0.0 {
+        Err(PresentedDrawableError::NotPresented)
+    } else {
+        Ok(PresentedDrawable {
+            drawable_id: actual_id,
+            presented_time,
+        })
+    }
+}
+
+fn record_observed_drawable(
+    observation: &ObservedDrawableResult,
+    result: Result<PresentedDrawable, PresentedDrawableError>,
+) {
+    if result != Err(PresentedDrawableError::NotPresented) {
+        // First validated recorded result wins. The cell is bounded even if every physical
+        // attempt is dropped; a duplicate or late callback cannot replace an accepted result.
+        let _ = observation.set(result);
+    }
+}
+
 type PresentedBlock = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLDrawable>>) + 'static>;
 
 /// Owned one-shot completion for one exact registered Metal drawable.
@@ -548,6 +632,7 @@ pub struct PresentedDrawableCompletion {
     expected_address: NonNull<()>,
     expected_id: usize,
     completed: bool,
+    observation: Option<Arc<ObservedDrawableResult>>,
 }
 
 impl PresentedDrawableCompletion {
@@ -559,6 +644,9 @@ impl PresentedDrawableCompletion {
         match self.receiver.try_recv() {
             Ok(result) => {
                 self.completed = true;
+                if let Some(observation) = &self.observation {
+                    record_observed_drawable(observation, result);
+                }
                 result.map(PresentedDrawableProgress::Presented)
             }
             Err(mpsc::TryRecvError::Empty) => Ok(PresentedDrawableProgress::Pending),
@@ -579,19 +667,40 @@ impl PresentedDrawableCompletion {
         }
         let actual_address = NonNull::from(drawable).cast::<()>();
         let actual_id = drawable.drawableID();
-        if actual_address != self.expected_address || actual_id != self.expected_id {
-            self.completed = true;
-            return Err(PresentedDrawableError::Identity);
-        }
         let presented_time = drawable.presentedTime();
-        if !presented_time.is_finite() || presented_time <= 0.0 {
-            return Ok(PresentedDrawableProgress::Pending);
-        }
-        self.completed = true;
-        Ok(PresentedDrawableProgress::Presented(PresentedDrawable {
-            drawable_id: actual_id,
+        self.observe_exact_drawable(actual_address, actual_id, presented_time)
+    }
+
+    fn observe_exact_drawable(
+        &mut self,
+        actual_address: NonNull<()>,
+        actual_id: usize,
+        presented_time: f64,
+    ) -> Result<PresentedDrawableProgress, PresentedDrawableError> {
+        let evidence = match checked_drawable_evidence(
+            self.expected_address,
+            self.expected_id,
+            actual_address,
+            actual_id,
             presented_time,
-        }))
+        ) {
+            Ok(evidence) => evidence,
+            Err(PresentedDrawableError::NotPresented) => {
+                return Ok(PresentedDrawableProgress::Pending);
+            }
+            Err(error) => {
+                self.completed = true;
+                if let Some(observation) = &self.observation {
+                    record_observed_drawable(observation, Err(error));
+                }
+                return Err(error);
+            }
+        };
+        self.completed = true;
+        if let Some(observation) = &self.observation {
+            record_observed_drawable(observation, Ok(evidence));
+        }
+        Ok(PresentedDrawableProgress::Presented(evidence))
     }
 }
 
@@ -606,9 +715,18 @@ pub(crate) fn register_presented_drawable_with_wake(
     drawable: &ProtocolObject<dyn MTLDrawable>,
     wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 ) -> PresentedDrawableCompletion {
+    register_presented_drawable_with_observation(drawable, wake, None)
+}
+
+fn register_presented_drawable_with_observation(
+    drawable: &ProtocolObject<dyn MTLDrawable>,
+    wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    observation: Option<Arc<ObservedDrawableResult>>,
+) -> PresentedDrawableCompletion {
     let expected_address = NonNull::from(drawable).cast::<()>();
     let expected_id = drawable.drawableID();
     let (sender, receiver) = mpsc::sync_channel(1);
+    let callback_observation = observation.clone();
     let block = RcBlock::new(move |actual: NonNull<ProtocolObject<dyn MTLDrawable>>| {
         let actual_address = actual.cast::<()>();
         // SAFETY: Metal invokes `MTLDrawablePresentedHandler` with a valid drawable pointer
@@ -616,16 +734,16 @@ pub(crate) fn register_presented_drawable_with_wake(
         let actual = unsafe { actual.as_ref() };
         let actual_id = actual.drawableID();
         let presented_time = actual.presentedTime();
-        let result = if actual_address != expected_address || actual_id != expected_id {
-            Err(PresentedDrawableError::Identity)
-        } else if !presented_time.is_finite() || presented_time <= 0.0 {
-            Err(PresentedDrawableError::NotPresented)
-        } else {
-            Ok(PresentedDrawable {
-                drawable_id: actual_id,
-                presented_time,
-            })
-        };
+        let result = checked_drawable_evidence(
+            expected_address,
+            expected_id,
+            actual_address,
+            actual_id,
+            presented_time,
+        );
+        if let Some(observation) = &callback_observation {
+            record_observed_drawable(observation, result);
+        }
         let _ = sender.try_send(result);
         if let Some(wake) = wake.as_ref() {
             // A caller panic must never unwind through Metal's Objective-C callback frame. The
@@ -642,6 +760,7 @@ pub(crate) fn register_presented_drawable_with_wake(
         expected_address,
         expected_id,
         completed: false,
+        observation,
     }
 }
 
@@ -650,6 +769,180 @@ mod tests {
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
     use super::*;
+
+    fn observation() -> DrawablePresentationObservation {
+        let layer = CAMetalLayer::new();
+        let mut extent = layer.drawableSize();
+        extent.width = 96.0;
+        extent.height = 96.0;
+        layer.setDrawableSize(extent);
+        DrawablePresentationObservation::new(
+            DrawablePresentationGeneration::try_new(layer, 96, 96, 1).unwrap(),
+        )
+    }
+
+    fn observed(id: usize, time: f64) -> Result<PresentedDrawable, PresentedDrawableError> {
+        let identity = ();
+        let address = NonNull::from(&identity);
+        checked_drawable_evidence(address, id, address, id, time)
+    }
+
+    #[test]
+    fn retired_attempt_callback_outlives_repeated_physical_replacement() {
+        let mut observation = observation();
+        // This Arc models the callback copied/retained by Metal, not a drawable resource owner.
+        let delayed_callback = Arc::clone(&observation.result);
+        for _service_opportunity in 0..10_000 {
+            let attempt = Arc::clone(&observation.result);
+            record_observed_drawable(&attempt, Err(PresentedDrawableError::NotPresented));
+            drop(attempt);
+            assert_eq!(
+                observation.try_complete(),
+                Ok(PresentedDrawableProgress::Pending)
+            );
+        }
+        assert!(observation.result.get().is_none());
+        record_observed_drawable(&delayed_callback, observed(17, 1.5));
+        assert_eq!(
+            observation.try_complete(),
+            Ok(PresentedDrawableProgress::Presented(PresentedDrawable {
+                drawable_id: 17,
+                presented_time: 1.5
+            })),
+        );
+        assert_eq!(
+            observation.try_complete(),
+            Err(PresentedDrawableError::AlreadyCompleted)
+        );
+        assert_eq!(
+            observation.ensure_live(),
+            Err(PresentedDrawableError::AlreadyCompleted)
+        );
+    }
+
+    #[test]
+    fn first_valid_recording_wins_even_if_later_callback_has_earlier_time() {
+        let mut observation = observation();
+        let first = observed(9, 3.0);
+        // The exact getter and callback both use this identical bounded recording operation.
+        record_observed_drawable(&observation.result, first);
+        record_observed_drawable(&observation.result, observed(2, 1.0));
+        record_observed_drawable(&observation.result, Err(PresentedDrawableError::Identity));
+        assert_eq!(
+            observation.try_complete(),
+            first.map(PresentedDrawableProgress::Presented),
+        );
+    }
+
+    #[test]
+    fn exact_getter_before_callback_populates_the_same_once_observation() {
+        let mut observation = observation();
+        let identity = ();
+        let address = NonNull::from(&identity);
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let block: PresentedBlock = RcBlock::new(|_| {});
+        let mut attempt = PresentedDrawableCompletion {
+            receiver,
+            _block: block,
+            expected_address: address,
+            expected_id: 7,
+            completed: false,
+            observation: Some(Arc::clone(&observation.result)),
+        };
+        assert_eq!(
+            attempt.try_complete(),
+            Ok(PresentedDrawableProgress::Pending)
+        );
+        assert_eq!(
+            attempt.observe_exact_drawable(address, 7, 0.0),
+            Ok(PresentedDrawableProgress::Pending),
+        );
+        assert_eq!(
+            observation.try_complete(),
+            Ok(PresentedDrawableProgress::Pending)
+        );
+        let evidence = PresentedDrawable {
+            drawable_id: 7,
+            presented_time: 2.0,
+        };
+        assert_eq!(
+            attempt.observe_exact_drawable(address, 7, 2.0),
+            Ok(PresentedDrawableProgress::Presented(evidence)),
+        );
+        drop(attempt);
+        assert_eq!(
+            observation.try_complete(),
+            Ok(PresentedDrawableProgress::Presented(evidence))
+        );
+        // The old callback can arrive later without replacing the winning evidence or reopening
+        // enrollment. No physical resource needs to remain owned for this late result.
+        record_observed_drawable(&observation.result, observed(7, 2.0));
+        assert_eq!(
+            observation.ensure_live(),
+            Err(PresentedDrawableError::AlreadyCompleted)
+        );
+        assert_eq!(
+            observation.try_complete(),
+            Err(PresentedDrawableError::AlreadyCompleted)
+        );
+    }
+
+    #[test]
+    fn exact_identity_failure_refuses_and_dropped_attempt_is_not_success() {
+        let mut observation = observation();
+        let identities = [0_u8, 1_u8];
+        let a = NonNull::from(&identities[0]).cast();
+        let b = NonNull::from(&identities[1]).cast();
+        for time in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(observed(9, time), Err(PresentedDrawableError::NotPresented));
+        }
+        for result in [
+            checked_drawable_evidence(a, 9, b, 9, 1.0),
+            checked_drawable_evidence(a, 9, a, 10, 1.0),
+        ] {
+            assert_eq!(result, Err(PresentedDrawableError::Identity));
+            record_observed_drawable(&observation.result, result);
+        }
+        record_observed_drawable(&observation.result, observed(9, 1.0));
+        assert_eq!(
+            observation.try_complete(),
+            Err(PresentedDrawableError::Identity)
+        );
+    }
+
+    #[test]
+    fn registered_callback_records_exact_failure_after_completion_owner_is_dropped() {
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("test host has Metal");
+        let mut observation = observation();
+        observation.generation.layer.setDevice(Some(&device));
+        let expected = observation
+            .generation
+            .layer
+            .nextDrawable()
+            .expect("first drawable");
+        let foreign = observation
+            .generation
+            .layer
+            .nextDrawable()
+            .expect("distinct drawable");
+        let expected_drawable: &ProtocolObject<dyn CAMetalDrawable> = &expected;
+        let completion = register_presented_drawable_with_observation(
+            expected_drawable.as_ref(),
+            None,
+            Some(Arc::clone(&observation.result)),
+        );
+        // Invoke the actual registered block after retiring its completion owner, with a genuine
+        // but foreign drawable. This tests callback wiring/lifetime, not physical display success.
+        let callback = completion._block.clone();
+        drop(completion);
+        drop(expected);
+        let foreign_drawable: &ProtocolObject<dyn CAMetalDrawable> = &foreign;
+        callback.call((NonNull::from(foreign_drawable.as_ref()),));
+        assert_eq!(
+            observation.try_complete(),
+            Err(PresentedDrawableError::Identity)
+        );
+    }
 
     #[test]
     fn external_epoch_keeps_returned_extent_distinct() {

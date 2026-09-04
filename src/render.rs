@@ -13,9 +13,9 @@ use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLCullMode, MTLDepthStencilState, MTLDevice, MTLDrawable, MTLLoadAction,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferError, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDepthStencilState, MTLDevice, MTLDrawable,
+    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
     MTLRenderPassDescriptor as RawRenderPassDescriptor, MTLRenderPipelineColorAttachmentDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLSamplerState, MTLScissorRect,
     MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureType,
@@ -95,6 +95,39 @@ pub enum RenderExecutionStatus {
     Unknown,
 }
 
+/// Terminal failure code reported by Metal for one exact command buffer.
+///
+/// This is inert diagnostic evidence. It exposes no command buffer, queue, encoder, resource,
+/// synchronization operation, or recovery authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RenderExecutionFailure {
+    /// Metal reported an internal implementation failure.
+    Internal,
+    /// Metal stopped work that exceeded its execution-time allowance.
+    Timeout,
+    /// GPU execution referenced inaccessible memory.
+    PageFault,
+    /// The process no longer had permission to use the selected device.
+    AccessRevoked,
+    /// The command was not permitted by the operating system.
+    NotPermitted,
+    /// The device could not provide the memory required by the command.
+    OutOfMemory,
+    /// A resource used by the command was invalid.
+    InvalidResource,
+    /// A memoryless resource was used outside its valid lifetime.
+    Memoryless,
+    /// The selected device was removed before completion.
+    DeviceRemoved,
+    /// Shader execution exhausted its stack.
+    StackOverflow,
+    /// Metal supplied a command-buffer error code not known by this crate version.
+    Unknown(isize),
+    /// Metal reported terminal failure without supplying an error object.
+    Unreported,
+}
+
 /// Nonblocking completion state of one committed non-presenting render submission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "pending private render work must continue to be polled"]
@@ -132,6 +165,120 @@ impl RenderExecutionStatus {
             MTLCommandBufferStatus::Error => Self::Error,
             _ => Self::Unknown,
         }
+    }
+}
+
+fn render_execution_failure(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Option<RenderExecutionFailure> {
+    if !matches!(
+        RenderExecutionStatus::from_metal(command_buffer.status()),
+        RenderExecutionStatus::Error | RenderExecutionStatus::Unknown
+    ) {
+        return None;
+    }
+    let Some(error) = command_buffer.error() else {
+        return Some(RenderExecutionFailure::Unreported);
+    };
+    Some(classify_execution_failure(error.code()))
+}
+
+fn classify_execution_failure(code: isize) -> RenderExecutionFailure {
+    match code {
+        code if code == MTLCommandBufferError::Internal.0 as isize => {
+            RenderExecutionFailure::Internal
+        }
+        code if code == MTLCommandBufferError::Timeout.0 as isize => {
+            RenderExecutionFailure::Timeout
+        }
+        code if code == MTLCommandBufferError::PageFault.0 as isize => {
+            RenderExecutionFailure::PageFault
+        }
+        code if code == MTLCommandBufferError::AccessRevoked.0 as isize => {
+            RenderExecutionFailure::AccessRevoked
+        }
+        code if code == MTLCommandBufferError::NotPermitted.0 as isize => {
+            RenderExecutionFailure::NotPermitted
+        }
+        code if code == MTLCommandBufferError::OutOfMemory.0 as isize => {
+            RenderExecutionFailure::OutOfMemory
+        }
+        code if code == MTLCommandBufferError::InvalidResource.0 as isize => {
+            RenderExecutionFailure::InvalidResource
+        }
+        code if code == MTLCommandBufferError::Memoryless.0 as isize => {
+            RenderExecutionFailure::Memoryless
+        }
+        code if code == MTLCommandBufferError::DeviceRemoved.0 as isize => {
+            RenderExecutionFailure::DeviceRemoved
+        }
+        code if code == MTLCommandBufferError::StackOverflow.0 as isize => {
+            RenderExecutionFailure::StackOverflow
+        }
+        code => RenderExecutionFailure::Unknown(code),
+    }
+}
+
+#[cfg(test)]
+mod execution_failure_tests {
+    use super::*;
+
+    #[test]
+    fn every_known_metal_command_failure_has_one_stable_diagnostic_category() {
+        let cases = [
+            (
+                MTLCommandBufferError::Internal,
+                RenderExecutionFailure::Internal,
+            ),
+            (
+                MTLCommandBufferError::Timeout,
+                RenderExecutionFailure::Timeout,
+            ),
+            (
+                MTLCommandBufferError::PageFault,
+                RenderExecutionFailure::PageFault,
+            ),
+            (
+                MTLCommandBufferError::AccessRevoked,
+                RenderExecutionFailure::AccessRevoked,
+            ),
+            (
+                MTLCommandBufferError::NotPermitted,
+                RenderExecutionFailure::NotPermitted,
+            ),
+            (
+                MTLCommandBufferError::OutOfMemory,
+                RenderExecutionFailure::OutOfMemory,
+            ),
+            (
+                MTLCommandBufferError::InvalidResource,
+                RenderExecutionFailure::InvalidResource,
+            ),
+            (
+                MTLCommandBufferError::Memoryless,
+                RenderExecutionFailure::Memoryless,
+            ),
+            (
+                MTLCommandBufferError::DeviceRemoved,
+                RenderExecutionFailure::DeviceRemoved,
+            ),
+            (
+                MTLCommandBufferError::StackOverflow,
+                RenderExecutionFailure::StackOverflow,
+            ),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(classify_execution_failure(code.0 as isize), expected);
+        }
+    }
+
+    #[test]
+    fn an_unknown_metal_command_failure_preserves_its_exact_code() {
+        let unknown = isize::MAX;
+        assert_eq!(
+            classify_execution_failure(unknown),
+            RenderExecutionFailure::Unknown(unknown)
+        );
     }
 }
 
@@ -918,6 +1065,11 @@ impl PendingRender {
         RenderExecutionStatus::from_metal(self.command_buffer.status())
     }
 
+    /// Returns Metal's terminal diagnostic code after this exact private submission fails.
+    pub fn execution_failure(&self) -> Option<RenderExecutionFailure> {
+        render_execution_failure(&self.command_buffer)
+    }
+
     /// Returns device execution timing after this exact command buffer completed successfully.
     pub fn execution_timing(&self) -> Option<RenderExecutionTiming> {
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -959,6 +1111,11 @@ impl PendingPresentedRender {
     /// Current inert Metal execution state without consuming presentation completion evidence.
     pub fn execution_status(&self) -> RenderExecutionStatus {
         RenderExecutionStatus::from_metal(self.command_buffer.status())
+    }
+
+    /// Returns Metal's terminal diagnostic code after this exact presented submission fails.
+    pub fn execution_failure(&self) -> Option<RenderExecutionFailure> {
+        render_execution_failure(&self.command_buffer)
     }
 
     /// Returns device execution timing after Metal has completed the command buffer.

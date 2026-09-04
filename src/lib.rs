@@ -9,10 +9,10 @@ mod render;
 
 pub use render::{
     BoundVertexRecords, ColorLoad, ColorStore, PendingPresentedRender, PendingRender,
-    PendingRenderProgress, RenderCommandBuffer, RenderCommandError, RenderExecutionStatus,
-    RenderExecutionTiming, RenderPassDescriptor, RenderPipelineAttachmentError, Texture2DMips,
-    Texture2DStorage, Texture2DUse, TextureAllocationError, new_texture_2d,
-    render_pipeline_color_attachment,
+    PendingRenderProgress, RenderCommandBuffer, RenderCommandError, RenderExecutionFailure,
+    RenderExecutionStatus, RenderExecutionTiming, RenderPassDescriptor,
+    RenderPipelineAttachmentError, Texture2DMips, Texture2DStorage, Texture2DUse,
+    TextureAllocationError, new_texture_2d, render_pipeline_color_attachment,
 };
 
 use std::ffi::c_void;

@@ -37,6 +37,19 @@ fragment float4 fragment_main(
 {
     return color;
 }
+
+struct ScaledRadiance {
+    float4 mantissa [[color(0)]];
+    int4 exponent [[color(1)]];
+};
+
+fragment ScaledRadiance fragment_scaled()
+{
+    ScaledRadiance result;
+    result.mantissa = float4(0.75, 0.5, 0.625, 0.0);
+    result.exponent = int4(12, -4, 40, 0);
+    return result;
+}
 "#;
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -220,6 +233,81 @@ fn metal_render_transaction_draws_exact_checked_triangle() {
         pixels[center + 3]
     );
     assert_eq!(&pixels[0..4], &[0, 0, 0, 255]);
+
+    let scaled_fragment_name = NSString::from_str("fragment_scaled");
+    let scaled_fragment = library
+        .newFunctionWithName(&scaled_fragment_name)
+        .expect("scaled-radiance fragment exists");
+    let scaled_pipeline_descriptor = MTLRenderPipelineDescriptor::new();
+    scaled_pipeline_descriptor.setVertexFunction(Some(&vertex));
+    scaled_pipeline_descriptor.setFragmentFunction(Some(&scaled_fragment));
+    render_pipeline_color_attachment(&scaled_pipeline_descriptor, 0)
+        .expect("mantissa attachment is bounded")
+        .setPixelFormat(MTLPixelFormat::RGBA32Float);
+    render_pipeline_color_attachment(&scaled_pipeline_descriptor, 1)
+        .expect("exponent attachment is bounded")
+        .setPixelFormat(MTLPixelFormat::RGBA32Sint);
+    let scaled_pipeline = device
+        .newRenderPipelineStateWithDescriptor_error(&scaled_pipeline_descriptor)
+        .expect("scaled-radiance render pipeline compiles");
+    let mantissa = new_texture_2d(
+        &device,
+        32,
+        32,
+        MTLPixelFormat::RGBA32Float,
+        Texture2DStorage::Private,
+        Texture2DUse::RenderTargetAndSampled,
+        Texture2DMips::One,
+    )
+    .expect("private float mantissa render-and-sample target allocates");
+    let exponent = new_texture_2d(
+        &device,
+        32,
+        32,
+        MTLPixelFormat::RGBA32Sint,
+        Texture2DStorage::Private,
+        Texture2DUse::RenderTargetAndSampled,
+        Texture2DMips::One,
+    )
+    .expect("private signed exponent render-and-sample target allocates");
+    let mut scaled_pass = RenderPassDescriptor::new();
+    scaled_pass
+        .set_color_attachment(0, &mantissa, ColorLoad::Clear([0.0; 4]), ColorStore::Store)
+        .expect("float mantissa is a lawful color attachment");
+    scaled_pass
+        .set_color_attachment(1, &exponent, ColorLoad::Clear([0.0; 4]), ColorStore::Store)
+        .expect("signed exponent is a lawful color attachment");
+    let mut scaled_command =
+        RenderCommandBuffer::new(&queue).expect("scaled command buffer allocation works");
+    {
+        let mut pass = scaled_command
+            .begin_render_pass(&scaled_pass)
+            .expect("scaled render pass begins");
+        pass.set_pipeline(&scaled_pipeline);
+        let records = pass
+            .bind_vertex_records(0, &vertex_buffer, 0, 8, 3)
+            .expect("scaled pass binds exact positions");
+        pass.draw_triangles(&records, 0..3)
+            .expect("scaled pass accepts the exact triangle");
+        pass.end();
+    }
+    scaled_command
+        .commit_and_wait()
+        .expect("scaled-radiance render completes successfully");
+
+    assert_eq!(
+        new_texture_2d(
+            &device,
+            1,
+            1,
+            MTLPixelFormat::Invalid,
+            Texture2DStorage::Private,
+            Texture2DUse::RenderTarget,
+            Texture2DMips::One,
+        ),
+        Err(TextureAllocationError::PixelFormat),
+        "the explicit allowlist must still reject arbitrary Metal formats"
+    );
 
     let mut clear = RenderPassDescriptor::new();
     clear
